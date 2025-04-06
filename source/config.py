@@ -1,5 +1,2 @@
-API_TOKEN = 'YOUR_BOT_TOKEN'  # Замени на свой токен
-SUPERADMIN_ID = 123456789     # Замени на свой Telegram ID
-DB_PATH = 'real_estate.db'
-CREDENTIALS_PATH = 'credentials.json'
-SHEET_NAME = 'HousingParams'
+API_TOKEN = '8172253125:AAFOoq4B5hCVndNIoZ9eA2iL8N5RmoOUjHQ'
+DB_PATH = 'rentbot.db'

@@ -4,5 +4,10 @@ class AdminAddState(StatesGroup):
     waiting_for_username = State()
 
 class ListingState(StatesGroup):
-    type = State()
-    dynamic = State()
+    step = State()
+
+class SearchState(StatesGroup):
+    step = State()
+
+class EditState(StatesGroup):
+    step = State()
