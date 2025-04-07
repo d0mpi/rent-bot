@@ -1,7 +1,8 @@
+#admin.py
 import os
-from aiogram import types
+from aiogram import Bot, types
 from aiogram.fsm.context import FSMContext
-from db import add_listing, get_user_role, update_listing, delete_listing, search_listings
+from db import add_listing, generate_referral_code, get_connection, get_user_role, sync_clients, sync_referral_stats, update_listing, delete_listing, search_listings
 from keyboards import get_main_menu, add_back_button
 from states import ListingState, EditState
 import gspread
@@ -25,36 +26,31 @@ def load_param_values():
         'districts_by_city': {},
         'rooms': set(),
         'floor': set(),
-        'max_price': set(),
-        'min_price': set()
     }
     for row in data:
         result['city'].add(str(row['city']))
         result['districts_by_city'].setdefault(row['city'], set()).add(str(row['district']))
         result['rooms'].add(str(row['rooms']))
         result['floor'].add(str(row['floor']))
-        result['max_price'].add(str(row['max_price']))
-        result['min_price'].add(str(row['min_price']))
     USER_VALUES = result
 
 load_param_values()
 
 LISTING_STEPS = {
-    'Квартира': [
+    'Аренда': [
         ('city', 'Какой город', lambda state_data=None: sorted(list(USER_VALUES['city']))),
+        ('price', 'Укажите цену (введите число или пропустите)', lambda state_data=None: None),
+        ('deposit', 'Наличие кауции (Да/Нет или пропустите)', lambda state_data=None: ['Да', 'Нет']),
         ('district', 'Какой район', lambda state_data: sorted(list(USER_VALUES['districts_by_city'].get(state_data.get('params_collected', {}).get('city', ''), set())))),
-        ('rooms', 'Сколько комнат', lambda state_data=None: sorted(list(USER_VALUES['rooms']))),
+        ('address', 'Укажите адрес или ориентир (или пропустите)', lambda state_data=None: None),
+        ('room_type', 'Тип комнаты', lambda state_data=None: ['Отдельная', 'Смежная', 'Студия']),
+        ('term', 'Формат аренды', lambda state_data=None: ['Краткосрочная', 'Долгосрочная']),
+        ('room_area', 'Площадь комнаты (в м², введите число или пропустите)', lambda state_data=None: None),
+        ('total_area', 'Площадь квартиры (в м², введите число или пропустите)', lambda state_data=None: None),
         ('floor', 'Этаж', lambda state_data=None: sorted(list(USER_VALUES['floor']))),
-        ('max_price', 'Максимальная стоимость', lambda state_data=None: sorted(list(USER_VALUES['max_price']))),
-        ('description', 'Введите описание', lambda state_data=None: None),
-        ('image_paths', 'Загрузите до 10 фото (отправляйте по одному)', lambda state_data=None: None)
-    ],
-    'Дом': [
-        ('city', 'Какой город', lambda state_data=None: sorted(list(USER_VALUES['city']))),
-        ('district', 'Район', lambda state_data: sorted(list(USER_VALUES['districts_by_city'].get(state_data.get('params_collected', {}).get('city', ''), set())))),
-        ('min_price', 'Минимальная стоимость', lambda state_data=None: sorted(list(USER_VALUES['min_price']))),
-        ('max_price', 'Максимальная стоимость', lambda state_data=None: sorted(list(USER_VALUES['max_price']))),
-        ('description', 'Введите описание', lambda state_data=None: None),
+        ('rooms', 'Кол-во комнат в квартире', lambda state_data=None: sorted(list(USER_VALUES['rooms']))),
+        ('telegram_post_link', 'Ссылка на пост в Telegram (или пропустите)', lambda state_data=None: None),
+        ('description', 'Введите описание (или пропустите)', lambda state_data=None: None),
         ('image_paths', 'Загрузите до 10 фото (отправляйте по одному)', lambda state_data=None: None)
     ]
 }
@@ -76,6 +72,25 @@ async def process_listing_type(callback: types.CallbackQuery, state: FSMContext)
     await state.set_state(ListingState.step)
     await process_listing_step(callback, state)
 
+async def process_listing_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    param_key = data['current_param']
+    params_collected = data['params_collected']
+    
+    if param_key in ['price', 'room_area', 'total_area']:
+        try:
+            value = float(message.text)
+            params_collected[param_key] = value
+        except ValueError:
+            await message.reply("Пожалуйста, введите корректное число!")
+            return
+    elif param_key in ['address', 'description', 'telegram_post_link']:  # Добавили telegram_post_link
+        params_collected[param_key] = message.text
+    # Район тоже можно вводить текстом, если это нужно, но оставим выбор через кнопки
+    
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_listing_step_after_message(message, state)
+
 async def process_listing_step(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     steps = LISTING_STEPS[data['type']]
@@ -89,18 +104,24 @@ async def process_listing_step(callback: types.CallbackQuery, state: FSMContext)
     options = options_func(data) if options_func else None
     await state.update_data(current_param=param_key)
     
-    if options:
+    buttons = []
+    if options:  # Если есть варианты выбора (кнопки)
         buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-        await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
-    else:
-        keyboard = add_back_button(None)
-        if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
-            buttons = [[types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")]]
-            keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-        await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
-        if param_key == 'image_paths':
-            await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
+    # Всегда добавляем "Пропустить"
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
+
+async def skip_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(step_index=data['step_index'] + 1)
+    await process_listing_step(callback, state)
+    await callback.answer()  # Подтверждаем обработку callback
 
 async def process_listing_option(callback: types.CallbackQuery, state: FSMContext):
     option = callback.data.split("_")[1]
@@ -109,14 +130,6 @@ async def process_listing_option(callback: types.CallbackQuery, state: FSMContex
     params_collected[data['current_param']] = option
     await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
     await process_listing_step(callback, state)
-
-async def process_listing_text(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    if data['current_param'] == 'description':
-        params_collected = data['params_collected']
-        params_collected['description'] = message.text
-        await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
-        await process_listing_step_after_message(message, state)
 
 async def process_listing_image(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -145,19 +158,18 @@ async def process_listing_step_after_message(message: types.Message, state: FSMC
     options = options_func(data) if options_func else None
     await state.update_data(current_param=param_key)
     
-    keyboard = add_back_button(None)
-    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
-        buttons = [[types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")]]
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-    
+    buttons = []
     if options:
         buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-        await message.reply(prompt + ":", reply_markup=keyboard)
-    else:
-        await message.reply(prompt + ":", reply_markup=keyboard)
-        if param_key == 'image_paths':
-            await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
+    # Всегда добавляем "Пропустить"
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.reply(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
 
 async def save_listing(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -196,16 +208,14 @@ async def edit_listing(callback: types.CallbackQuery, state: FSMContext):
         return
     listing = listings[0]
     role = get_user_role(callback.from_user.id)
-    if role != 'superadmin' and listing[8] != callback.from_user.id:
+    if role != 'superadmin' and listing[6] != callback.from_user.id:  # Индекс 6 - admin_id
         await callback.answer("Это не ваше объявление!", show_alert=True)
         return
     
-    await state.update_data(listing_id=listing_id, type=listing[1], params_collected={
-        'city': listing[2], 'district': listing[3], 'rooms': str(listing[4]) if listing[4] else '0',
-        'floor': str(listing[5]) if listing[5] else '0', 'max_price': str(listing[6]) if listing[6] else '0',
-        'min_price': str(listing[7]) if listing[7] else '0', 'description': listing[9] or '',
-        'image_paths': listing[10]  # Список путей
-    }, step_index=0)
+    # Используем params из новой структуры
+    params = listing[9]  # Индекс 9 - словарь params
+    params['image_paths'] = listing[8]  # Индекс 8 - image_paths
+    await state.update_data(listing_id=listing_id, type=listing[1], params_collected=params, step_index=0)
     await state.set_state(EditState.step)
     await process_edit_step(callback, state)
 
@@ -222,21 +232,28 @@ async def process_edit_step(callback: types.CallbackQuery, state: FSMContext):
     options = options_func(data) if options_func else None
     await state.update_data(current_param=param_key)
     
-    keyboard = add_back_button(None)
-    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
-        buttons = [[types.InlineKeyboardButton(text="Сохранить", callback_data="save_edit_listing")]]
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-    
+    buttons = []
     if options:
         buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"edit_option_{opt}")] for opt in options]
+        buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")])
         keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
         await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
                                         reply_markup=keyboard)
     else:
+        buttons = [[types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")]]
+        if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
+            buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_edit_listing")])
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
         await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
                                         reply_markup=keyboard)
         if param_key == 'image_paths':
             await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
+
+async def skip_edit_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    # Оставляем текущий параметр без изменений
+    await state.update_data(step_index=data['step_index'] + 1)
+    await process_edit_step(callback, state)
 
 async def process_edit_option(callback: types.CallbackQuery, state: FSMContext):
     option = callback.data.split("_")[2]
@@ -249,11 +266,20 @@ async def process_edit_option(callback: types.CallbackQuery, state: FSMContext):
 async def process_edit_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     param_key = data['current_param']
-    if param_key == 'description':
-        params_collected = data['params_collected']
-        params_collected['description'] = message.text
-        await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
-        await process_edit_step_after_message(message, state)
+    params_collected = data['params_collected']
+    
+    if param_key in ['price', 'room_area', 'total_area']:
+        try:
+            value = float(message.text)
+            params_collected[param_key] = value
+        except ValueError:
+            await message.reply("Пожалуйста, введите корректное число!")
+            return
+    elif param_key in ['address', 'description', 'telegram_post_link']:  # Добавили telegram_post_link
+        params_collected[param_key] = message.text
+    
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_edit_step_after_message(message, state)
 
 async def process_edit_image(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -333,3 +359,129 @@ async def delete_listing(callback: types.CallbackQuery):
 async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(callback.from_user.id))
+
+from states import ReferralState
+
+# Начало работы с реферальной программой
+async def referral_program_start(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    buttons = [
+        [types.InlineKeyboardButton(text="Создать реферальную ссылку", callback_data="create_referral")],
+        [types.InlineKeyboardButton(text="Мои реферальные ссылки", callback_data="list_referrals")]
+    ]
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Реферальная программа:", reply_markup=keyboard)
+
+# Создание новой реферальной ссылки
+async def create_referral_start(callback: types.CallbackQuery, state: FSMContext):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    await state.set_state(ReferralState.waiting_for_description_create)
+    await callback.message.edit_text("Введите описание для реферальной ссылки:")
+
+async def process_referral_description_create(message: types.Message, state: FSMContext, bot: Bot):
+    description = message.text
+    admin_id = message.from_user.id
+    referral_code = generate_referral_code()
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT INTO referral_links (admin_id, referral_code, description) VALUES (?, ?, ?)", 
+              (admin_id, referral_code, description))
+    conn.commit()
+    conn.close()
+    bot_username = (await bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={referral_code}"
+    await message.reply(f"Реферальная ссылка создана! Ссылка: {link}\nОписание: {description}", 
+                       reply_markup=get_main_menu(admin_id))
+    await state.clear()
+
+async def list_referrals(callback: types.CallbackQuery, bot: Bot):  # Добавляем bot как параметр
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    admin_id = callback.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, referral_code, description FROM referral_links WHERE admin_id=?", (admin_id,))
+    referrals = c.fetchall()
+    conn.close()
+    if not referrals:
+        await callback.message.edit_text("У вас нет реферальных ссылок.", 
+                                       reply_markup=get_main_menu(admin_id))
+        return
+    bot_username = (await bot.get_me()).username  # Получаем имя бота
+    buttons = []
+    for ref_id, code, desc in referrals:
+        link = f"https://t.me/{bot_username}?start={code}"
+        # Обновляем текст кнопки, чтобы включить полную ссылку
+        buttons.append([types.InlineKeyboardButton(text=f"{desc}: {link}", callback_data=f"referral_{ref_id}")])
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Ваши реферальные ссылки:", reply_markup=keyboard)
+
+# Опции для конкретной ссылки
+async def referral_options(callback: types.CallbackQuery):
+    ref_id = int(callback.data.split("_")[1])
+    buttons = [
+        [types.InlineKeyboardButton(text="Редактировать", callback_data=f"edit_referral_{ref_id}")],
+        [types.InlineKeyboardButton(text="Удалить", callback_data=f"delete_referral_{ref_id}")]
+    ]
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Выберите действие:", reply_markup=keyboard)
+
+# Удаление ссылки
+async def delete_referral(callback: types.CallbackQuery):
+    ref_id = int(callback.data.split("_")[2])
+    admin_id = callback.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM referral_links WHERE id=? AND admin_id=?", (ref_id, admin_id))
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text("Реферальная ссылка удалена!", 
+                                   reply_markup=get_main_menu(admin_id))
+
+# Редактирование ссылки
+async def edit_referral_start(callback: types.CallbackQuery, state: FSMContext):
+    ref_id = int(callback.data.split("_")[2])
+    await state.update_data(ref_id=ref_id)
+    await state.set_state(ReferralState.waiting_for_description_edit)
+    await callback.message.edit_text("Введите новое описание для реферальной ссылки:")
+
+async def process_referral_description_edit(message: types.Message, state: FSMContext):
+    description = message.text
+    data = await state.get_data()
+    ref_id = data['ref_id']
+    admin_id = message.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE referral_links SET description=? WHERE id=? AND admin_id=?", 
+              (description, ref_id, admin_id))
+    conn.commit()
+    conn.close()
+    await message.reply("Описание обновлено!", reply_markup=get_main_menu(admin_id))
+    await state.clear()
+
+
+async def sync_data(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    try:
+        sync_clients()
+        sync_referral_stats()
+        await callback.message.edit_text("Данные синхронизированы!", 
+                                       reply_markup=get_main_menu(callback.from_user.id))
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка: {str(e)}", 
+                                       reply_markup=get_main_menu(callback.from_user.id))
+        
+async def show_admin_menu(message: types.Message):
+    user_id = message.from_user.id
+    role = get_user_role(user_id)
+    if role in ['admin', 'superadmin']:
+        await message.reply("Меню администратора:", reply_markup=get_main_menu(user_id))
+    else:
+        await message.reply("Эта команда доступна только администраторам.")
