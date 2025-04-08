@@ -1,0 +1,1360 @@
+--- rent-bot/source/db.py ---
+import os
+import random
+import sqlite3
+import string
+from config import DB_PATH
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY, username TEXT, role TEXT, 
+                  referral_link_id INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS listings
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  type TEXT, 
+                  admin_id INTEGER, 
+                  image_paths TEXT, 
+                  params TEXT,
+                  telegram_post_link TEXT)''')  # Добавлено поле для ссылки на пост
+    c.execute('''CREATE TABLE IF NOT EXISTS referral_links
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  admin_id INTEGER, 
+                  referral_code TEXT UNIQUE, 
+                  description TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS referral_link_clicks
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  referral_link_id INTEGER,
+                  listing_id INTEGER,
+                  click_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  user_id INTEGER)''')  # Новая таблица для отслеживания кликов
+    c.execute('''INSERT OR IGNORE INTO users (user_id, username, role) 
+                 VALUES (?, ?, ?);''', (462522839, '@l_michael_l', 'superadmin'))
+    conn.commit()
+    conn.close()
+
+def add_user(user_id, username, role='user', referral_link_id=None):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, role, referral_link_id) VALUES (?, ?, ?, ?)", 
+              (user_id, username, role, referral_link_id))
+    conn.commit()
+    conn.close()
+
+def generate_referral_code(length=8):
+    characters = string.ascii_letters + string.digits
+    while True:
+        code = ''.join(random.choice(characters) for _ in range(length))
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id FROM referral_links WHERE referral_code=?", (code,))
+        if not c.fetchone():
+            conn.close()
+            return code
+        conn.close()
+
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+def remove_user(user_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE user_id=? AND role='admin'", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_admins():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username FROM users WHERE role IN ('admin', 'superadmin')")
+    admins = c.fetchall()
+    conn.close()
+    return admins
+
+def get_user_role(user_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT role FROM users WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def add_listing(data, admin_id):
+    conn = get_connection()
+    c = conn.cursor()
+    image_paths = json.dumps(data.get('image_paths', []))
+    params = {k: v for k, v in data.items() if k not in ['type', 'image_paths', 'telegram_post_link'] and v is not None}
+    telegram_post_link = data.get('telegram_post_link')
+    c.execute('''INSERT INTO listings (type, admin_id, image_paths, params, telegram_post_link)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (data['type'], admin_id, image_paths, json.dumps(params), telegram_post_link))
+    conn.commit()
+    conn.close()
+
+def update_listing(listing_id, data):
+    conn = get_connection()
+    c = conn.cursor()
+    image_paths = json.dumps(data.get('image_paths', []))
+    params = {k: v for k, v in data.items() if k not in ['type', 'image_paths', 'telegram_post_link'] and v is not None}
+    telegram_post_link = data.get('telegram_post_link')
+    c.execute('''UPDATE listings SET type=?, image_paths=?, params=?, telegram_post_link=?
+                 WHERE id=?''',
+              (data['type'], image_paths, json.dumps(params), telegram_post_link, listing_id))
+    conn.commit()
+    conn.close()
+
+def delete_listing(listing_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM listings WHERE id=?", (listing_id,))
+    conn.commit()
+    conn.close()
+
+def get_listings_by_admin(admin_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, type, params, telegram_post_link FROM listings WHERE admin_id=?", (admin_id,))
+    listings = [(row[0], row[1], json.loads(row[2]) if row[2] else {}, row[3]) for row in c.fetchall()]
+    conn.close()
+    return listings
+
+def search_listings(filters):
+    conn = get_connection()
+    c = conn.cursor()
+    query = "SELECT id, type, admin_id, image_paths, params, telegram_post_link FROM listings WHERE 1=1"
+    params_list = []
+    
+    if 'type' in filters:
+        query += " AND type=?"
+        params_list.append(filters['type'])
+    
+    c.execute(query, params_list)
+    listings = c.fetchall()
+    
+    result = []
+    for listing in listings:
+        listing_id, listing_type, admin_id, image_paths, params_json, telegram_post_link = listing
+        params = json.loads(params_json) if params_json else {}
+        
+        matches = True
+        for key, value in filters.items():
+            if key == 'type':
+                continue
+            if key not in params or params[key] != value:
+                matches = False
+                break
+        
+        if matches:
+            result.append((
+                listing_id,
+                listing_type,
+                params.get('city', ''),
+                params.get('district', ''),
+                params.get('rooms', 0),
+                params.get('floor', 0),
+                admin_id,
+                params.get('description', ''),
+                json.loads(image_paths) if image_paths else [],
+                params,
+                telegram_post_link
+            ))
+    
+    conn.close()
+    return result
+
+def track_referral_click(referral_link_id, listing_id, user_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''INSERT INTO referral_link_clicks (referral_link_id, listing_id, user_id)
+                 VALUES (?, ?, ?)''', (referral_link_id, listing_id, user_id))
+    conn.commit()
+    conn.close()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "handlers/credentials.json")
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
+client = gspread.authorize(creds)
+sheet = client.open("Бот риэлтор")
+
+def get_or_create_worksheet(spreadsheet, title):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows="100", cols="20")
+
+def sync_clients():
+    worksheet = get_or_create_worksheet(sheet, "Пользователи")
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, referral_link_id FROM users")
+    users = c.fetchall()
+    conn.close()
+    data = [["user_id", "username", "referral_link_id"]]
+    for user in users:
+        data.append([str(user[0]), user[1], str(user[2]) if user[2] else ""])
+    worksheet.update('A1', data)
+
+def sync_referral_stats():
+    worksheet = get_or_create_worksheet(sheet, "Реферальная статистика")
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('''SELECT rl.id, rl.referral_code, rl.description, 
+                 COUNT(DISTINCT u.user_id) as unique_users, 
+                 COUNT(rlc.id) as total_clicks
+                 FROM referral_links rl 
+                 LEFT JOIN users u ON rl.id = u.referral_link_id
+                 LEFT JOIN referral_link_clicks rlc ON rl.id = rlc.referral_link_id
+                 GROUP BY rl.id''')
+    stats = c.fetchall()
+    conn.close()
+    data = [["id", "referral_code", "description", "unique_users", "total_clicks"]]
+    for stat in stats:
+        data.append([str(stat[0]), stat[1], stat[2], str(stat[3]), str(stat[4])])
+    worksheet.update('A1', data)
+
+--- rent-bot/source/config.py ---
+API_TOKEN = '8172253125:AAFOoq4B5hCVndNIoZ9eA2iL8N5RmoOUjHQ'
+DB_PATH = 'rentbot.db'
+WELCOME_MESSAGE = "Добро пожаловать! Выберите действие:"
+
+--- rent-bot/source/keyboards.py ---
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from db import get_user_role
+
+def get_main_menu(user_id):
+    buttons = []
+    role = get_user_role(user_id)
+    
+    if role == 'superadmin':
+        buttons.extend([
+            [InlineKeyboardButton(text="Добавить админа", callback_data="add_admin")],
+            [InlineKeyboardButton(text="Удалить админа", callback_data="remove_admin")],
+            [InlineKeyboardButton(text="Показать всех админов", callback_data="list_admins")],
+            [InlineKeyboardButton(text="Обновить данные в таблицах", callback_data="sync_data")]
+        ])
+    if role in ['admin', 'superadmin']:
+        buttons.extend([
+            [InlineKeyboardButton(text="Создать объявление", callback_data="create_listing")],
+            [InlineKeyboardButton(text="Вытащить данные из таблиц", callback_data="reload_params")],
+            [InlineKeyboardButton(text="Реферальная программа", callback_data="referral_program")]
+        ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+def get_request_keyboard(user_id):
+    role = get_user_role(user_id)
+    keyboard = [
+        [KeyboardButton(text="Оставить заявку"), KeyboardButton(text="Посмотреть варианты")]
+    ]
+    if role in ['admin', 'superadmin']:
+        keyboard.append([KeyboardButton(text="Меню")])
+    
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+def add_back_button(keyboard, is_search=False, is_listing=False):
+    if not keyboard:
+        if is_search:
+            return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="prev_search_step")]])
+        elif is_listing:
+            return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="prev_listing_step")]])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_to_start")]])
+    
+    if is_search:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="prev_search_step")])
+    elif is_listing:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="prev_listing_step")])
+    else:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="back_to_start")])
+    return keyboard
+
+--- rent-bot/source/main.py ---
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
+from aiogram import F
+from config import API_TOKEN, WELCOME_MESSAGE
+from db import init_db
+from handlers import superadmin, admin, user
+from states import AdminAddState, ListingState, SearchState, EditState, ReferralState, RequestState
+
+import os
+os.makedirs("uploads", exist_ok=True)
+init_db()
+
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot=bot, storage=storage)
+
+# Регистрация обработчиков
+dp.message.register(user.start, Command("start"))
+dp.message.register(user.search_start, F.text == "Посмотреть варианты")
+dp.message.register(admin.show_admin_menu, F.text == "Меню")
+dp.message.register(user.create_request_start, F.text == "Оставить заявку")
+
+# Superadmin
+dp.callback_query.register(superadmin.add_admin_start, F.data == "add_admin")
+dp.message.register(superadmin.process_admin_username, AdminAddState.waiting_for_username)
+dp.callback_query.register(superadmin.remove_admin_start, F.data == "remove_admin")
+dp.callback_query.register(superadmin.process_admin_removal, F.data.startswith("delete_admin_"))
+dp.callback_query.register(superadmin.list_admins, F.data == "list_admins")
+
+# Admin
+dp.callback_query.register(admin.create_listing_start, F.data == "create_listing")
+dp.callback_query.register(admin.process_listing_type, F.data.startswith("type_"))
+dp.callback_query.register(admin.process_listing_option, F.data.startswith("option_"), ListingState.step)
+dp.message.register(admin.process_listing_text, ListingState.step, F.text)
+dp.message.register(admin.process_listing_image, ListingState.step, F.photo)
+dp.callback_query.register(admin.manual_save_listing, F.data == "save_listing", ListingState.step)
+dp.callback_query.register(admin.prev_listing_step, F.data == "prev_listing_step", ListingState.step)
+dp.callback_query.register(admin.reload_params, F.data == "reload_params")
+dp.callback_query.register(admin.edit_listing, F.data.startswith("edit_"))
+dp.callback_query.register(admin.process_edit_option, F.data.startswith("edit_option_"), EditState.step)
+dp.message.register(admin.process_edit_text, EditState.step, F.text)
+dp.message.register(admin.process_edit_image, EditState.step, F.photo)
+dp.callback_query.register(admin.manual_save_edit_listing, F.data == "save_edit_listing", EditState.step)
+dp.callback_query.register(admin.delete_listing, F.data.startswith("delete_"))
+dp.callback_query.register(admin.back_to_start, F.data == "back_to_start")
+dp.callback_query.register(admin.referral_program_start, F.data == "referral_program")
+dp.callback_query.register(admin.create_referral_start, F.data == "create_referral")
+dp.message.register(admin.process_referral_description_create, ReferralState.waiting_for_description_create)
+dp.callback_query.register(admin.list_referrals, F.data == "list_referrals")
+dp.callback_query.register(admin.referral_options, F.data.startswith("referral_"))
+dp.callback_query.register(admin.delete_referral, F.data.startswith("delete_referral_"))
+dp.callback_query.register(admin.edit_referral_start, F.data.startswith("edit_referral_"))
+dp.message.register(admin.process_referral_description_edit, ReferralState.waiting_for_description_edit)
+dp.callback_query.register(admin.sync_data, F.data == "sync_data")
+
+# User
+dp.callback_query.register(user.process_search_type, F.data.startswith("search_type_"))
+dp.callback_query.register(user.process_search_option, F.data.startswith("search_option_"), SearchState.step)
+dp.message.register(user.process_search_text, SearchState.step, F.text)
+dp.callback_query.register(user.skip_search_step, F.data == "skip_search_step", SearchState.step)
+dp.callback_query.register(user.prev_search_step, F.data == "prev_search_step", SearchState.step)  # Новая регистрация
+dp.callback_query.register(user.back_to_start, F.data == "back_to_start")
+dp.callback_query.register(user.process_post_link, F.data.startswith("post_"))
+dp.callback_query.register(user.start_request_filling, F.data == "start_request_filling")
+dp.message.register(user.process_request_name, RequestState.waiting_for_name)
+dp.message.register(user.process_request_phone, RequestState.waiting_for_phone)
+dp.message.register(user.process_request_district, RequestState.waiting_for_district)
+dp.message.register(user.process_request_date, RequestState.waiting_for_date)
+dp.message.register(user.process_request_comment, RequestState.waiting_for_comment)
+
+if __name__ == '__main__':
+    dp.run_polling(bot)
+
+--- rent-bot/source/states.py ---
+# states.py
+from aiogram.fsm.state import State, StatesGroup
+
+class ReferralState(StatesGroup):
+    waiting_for_description_create = State()
+    waiting_for_description_edit = State()
+
+class AdminAddState(StatesGroup):
+    waiting_for_username = State()
+
+class ListingState(StatesGroup):
+    step = State()
+
+class SearchState(StatesGroup):
+    step = State()
+
+class EditState(StatesGroup):
+    step = State()
+
+class RequestState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_phone = State()
+    waiting_for_district = State()
+    waiting_for_date = State()
+    waiting_for_comment = State()
+
+--- rent-bot/source/handlers/superadmin.py ---
+#superadmin.py
+from aiogram import types
+from aiogram.fsm.context import FSMContext
+from db import add_user, remove_user, get_all_admins, get_user_role
+from keyboards import get_main_menu
+from states import AdminAddState
+
+async def add_admin_start(callback: types.CallbackQuery, state: FSMContext):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    await state.set_state(AdminAddState.waiting_for_username)
+    await callback.message.edit_text("Введите Telegram-ник админа (например, @username):")
+
+async def process_admin_username(message: types.Message, state: FSMContext):
+    if get_user_role(message.from_user.id) != 'superadmin':
+        await message.reply("Ты не суперадмин!")
+        return
+    username = message.text.strip()
+    if not username.startswith('@'):
+        await message.reply("Ник должен начинаться с @!")
+        return
+    add_user(hash(username), username)
+    await message.reply(f"Админ {username} добавлен!", reply_markup=get_main_menu(message.from_user.id))
+    await state.clear()
+
+async def remove_admin_start(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    admins = get_all_admins()
+    if not admins:
+        await callback.message.edit_text("Админов нет!", reply_markup=get_main_menu(callback.from_user.id))
+        return
+    buttons = [[types.InlineKeyboardButton(text=username, callback_data=f"delete_admin_{admin_id}")] for admin_id, username in admins]
+    await callback.message.edit_text("Выберите админа для удаления:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
+
+async def process_admin_removal(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    admin_id = int(callback.data.split("_")[2])
+    remove_user(admin_id)
+    await callback.message.edit_text("Админ удалён!", reply_markup=get_main_menu(callback.from_user.id))
+
+async def list_admins(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    admins = get_all_admins()
+    if not admins:
+        await callback.message.edit_text("Админов нет!", reply_markup=get_main_menu(callback.from_user.id))
+    else:
+        admin_list = "\n".join([admin[1] for admin in admins])
+        await callback.message.edit_text(f"Список админов:\n{admin_list}", reply_markup=get_main_menu(callback.from_user.id))
+
+--- rent-bot/source/handlers/user.py ---
+from aiogram import Bot, types
+from aiogram.fsm.context import FSMContext
+from db import get_connection, search_listings, get_user_role, get_all_admins, track_referral_click
+from keyboards import get_main_menu, add_back_button, get_request_keyboard
+from config import WELCOME_MESSAGE
+from states import SearchState, RequestState
+from handlers.admin import USER_VALUES
+import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+SEARCH_STEPS = {
+    'Аренда': [
+        ('type', 'Выберите тип сделки', lambda filters=None: ['Аренда']),
+        ('city', 'Какой город', lambda filters: sorted(list(USER_VALUES['city']))),
+        ('district', 'Какой район', lambda filters: sorted(list(USER_VALUES['districts_by_city'].get(filters.get('city', ''), set())))),
+        ('price', 'Максимальная цена (введите число или пропустите)', lambda filters=None: None),
+        ('deposit', 'Наличие кауции', lambda filters=None: ['Да', 'Нет', 'Не важно']),
+        ('room_type', 'Тип комнаты', lambda filters=None: ['Отдельная', 'Смежная', 'Студия']),
+        ('term', 'Формат аренды', lambda filters=None: ['Краткосрочная', 'Долгосрочная']),
+        ('rooms', 'Сколько комнат', lambda filters: sorted(list(USER_VALUES['rooms']))),
+        ('floor', 'Этаж', lambda filters: sorted(list(USER_VALUES['floor']))),
+    ]
+}
+
+# Google Sheets setup
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
+client = gspread.authorize(creds)
+sheet = client.open("Бот риэлтор")
+
+def get_or_create_worksheet(spreadsheet, title):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows="100", cols="20")
+
+async def start(message: types.Message, bot: Bot):
+    user_id = message.from_user.id
+    username = message.from_user.username or f"User_{user_id}"
+    referral_code = message.text.split(' ', 1)[1].strip() if message.text.startswith('/start ') else None
+    
+    referral_link_id = None
+    if referral_code:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id FROM referral_links WHERE referral_code=?", (referral_code,))
+        result = c.fetchone()
+        referral_link_id = result[0] if result else None
+        conn.close()
+    
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT referral_link_id FROM users WHERE user_id=?", (user_id,))
+    user = c.fetchone()
+    if user and user[0] is None and referral_link_id:
+        c.execute("UPDATE users SET referral_link_id=? WHERE user_id=?", (referral_link_id, user_id))
+    elif not user:
+        c.execute("INSERT INTO users (user_id, username, role, referral_link_id) VALUES (?, ?, ?, ?)", 
+                  (user_id, username, 'user', referral_link_id))
+    conn.commit()
+    conn.close()
+    
+    await message.reply(WELCOME_MESSAGE, reply_markup=get_request_keyboard(user_id))
+
+async def process_search_type(callback: types.CallbackQuery, state: FSMContext):
+    search_type = callback.data.split("_")[2]
+    await state.update_data(type=search_type, filters={'type': search_type}, step_index=1)
+    await state.set_state(SearchState.step)
+    await process_search_step(callback, state)
+
+async def process_search_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    param_key = data['current_param']
+    filters = data['filters']
+    
+    if param_key == 'price':
+        try:
+            value = float(message.text)
+            filters[param_key] = value
+            await message.reply(f"Максимальная цена установлена: {value}.", reply_markup=get_request_keyboard())
+        except ValueError:
+            await message.reply("Пожалуйста, введите корректное число!", reply_markup=get_request_keyboard())
+            return
+    
+    await state.update_data(filters=filters, step_index=data['step_index'] + 1)
+    await process_search_step_after_message(message, state)
+
+async def process_search_option(callback: types.CallbackQuery, state: FSMContext):
+    option = callback.data.split("_")[2]
+    data = await state.get_data()
+    filters = data['filters']
+    if option != 'Не важно':
+        filters[data['current_param']] = option
+    await state.update_data(filters=filters, step_index=data['step_index'] + 1)
+    await process_search_step(callback, state)
+
+async def skip_search_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(step_index=data['step_index'] + 1)
+    await process_search_step(callback, state)
+
+async def search_start(event: types.CallbackQuery | types.Message, state: FSMContext):
+    user_id = event.from_user.id if isinstance(event, types.CallbackQuery) else event.from_user.id
+    buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"search_type_{ht}")] for ht in SEARCH_STEPS.keys() if search_listings({'type': ht})]
+    
+    if not buttons:
+        text = "Нет доступных объявлений для поиска."
+        markup = get_main_menu(user_id) or get_request_keyboard(user_id)
+        if isinstance(event, types.CallbackQuery):
+            await event.message.edit_text(text, reply_markup=markup)
+        else:
+            await event.reply(text, reply_markup=markup)
+        return
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text("Выберите тип сделки для поиска:", reply_markup=keyboard)
+    else:
+        await event.reply("Выберите тип сделки для поиска:", reply_markup=keyboard)
+
+async def process_search_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    steps = SEARCH_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await show_search_results(callback, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    all_options = options_func(data['filters']) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    if all_options:
+        valid_options = []
+        current_filters = data['filters'].copy()
+        for option in all_options:
+            temp_filters = current_filters.copy()
+            if option != 'Не важно':
+                temp_filters[param_key] = option
+            if search_listings(temp_filters):
+                valid_options.append(option)
+        
+        if not valid_options:
+            await callback.message.edit_text("Нет доступных вариантов для продолжения поиска.", 
+                                            reply_markup=get_main_menu(callback.from_user.id))
+            await state.clear()
+            return
+            
+        buttons = [[types.InlineKeyboardButton(text=str(opt), callback_data=f"search_option_{opt}")] for opt in valid_options]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+        await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
+    else:
+        buttons = [[types.InlineKeyboardButton(text="Пропустить", callback_data="skip_search_step")]]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+        await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
+
+async def process_search_step_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    steps = SEARCH_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await show_search_results_after_message(message, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    all_options = options_func(data['filters']) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    if all_options:
+        valid_options = []
+        current_filters = data['filters'].copy()
+        for option in all_options:
+            temp_filters = current_filters.copy()
+            if option != 'Не важно':
+                temp_filters[param_key] = option
+            if search_listings(temp_filters):
+                valid_options.append(option)
+        
+        if not valid_options:
+            await message.reply("Нет доступных вариантов для продолжения поиска.", 
+                                reply_markup=get_main_menu(message.from_user.id))
+            await state.clear()
+            return
+            
+        buttons = [[types.InlineKeyboardButton(text=str(opt), callback_data=f"search_option_{opt}")] for opt in valid_options]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+        await message.reply(prompt + ":", reply_markup=keyboard)
+    else:
+        buttons = [[types.InlineKeyboardButton(text="Пропустить", callback_data="skip_search_step")]]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+        await message.reply(prompt + ":", reply_markup=keyboard)
+
+async def prev_search_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step_index = data.get('step_index', 1)
+    if step_index <= 1:
+        buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"search_type_{ht}")] for ht in SEARCH_STEPS.keys() if search_listings({'type': ht})]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_search=True)
+        await callback.message.edit_text("Выберите тип сделки для поиска:", reply_markup=keyboard)
+        await state.update_data(step_index=0)
+    else:
+        await state.update_data(step_index=step_index - 1)
+        await process_search_step(callback, state)
+    await callback.answer()
+
+
+async def show_search_results_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    listings = search_listings(data['filters'])
+    user_id = message.from_user.id
+    role = get_user_role(user_id)
+    
+    if not listings:
+        await message.reply("Объявлений не найдено.", reply_markup=get_main_menu(user_id))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        uploads_dir = os.path.join(base_dir, '..', 'uploads')
+        
+        for listing in listings:
+            listing_id, listing_type, _, _, _, _, admin_id, _, image_paths, params, telegram_post_link = listing
+            text = f"{listing_type}"
+            if 'city' in params: text += f" в {params['city']}"
+            if 'district' in params: text += f", район: {params['district']}"
+            if 'price' in params: text += f"\nЦена: {params['price']}"
+            if 'deposit' in params: text += f"\nКауция: {params['deposit']}"
+            if 'address' in params: text += f"\nАдрес: {params['address']}"
+            if 'room_type' in params: text += f"\nТип комнаты: {params['room_type']}"
+            if 'term' in params: text += f"\nФормат: {params['term']}"
+            if 'room_area' in params: text += f"\nПлощадь комнаты: {params['room_area']} м²"
+            if 'total_area' in params: text += f"\nПлощадь квартиры: {params['total_area']} м²"
+            if 'floor' in params: text += f"\nЭтаж: {params['floor']}"
+            if 'rooms' in params: text += f"\nКомнат: {params['rooms']}"
+            if 'description' in params: text += f"\nОписание: {params['description']}"
+            
+            buttons = []
+            if role == 'superadmin' or (role == 'admin' and admin_id == user_id):
+                buttons.append([
+                    types.InlineKeyboardButton(text="Редактировать", callback_data=f"edit_{listing_id}"),
+                    types.InlineKeyboardButton(text="Удалить", callback_data=f"delete_{listing_id}")
+                ])
+            if telegram_post_link:  # Проверяем наличие ссылки
+                buttons.append([
+                    types.InlineKeyboardButton(text="Перейти к посту", callback_data=f"post_{listing_id}")
+                ])
+            keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+            
+            if image_paths:
+                media_group = []
+                for i, path in enumerate(image_paths[:10]):
+                    absolute_path = os.path.join(uploads_dir, os.path.basename(path))
+                    if os.path.exists(absolute_path):
+                        media_group.append(
+                            types.InputMediaPhoto(
+                                media=types.FSInputFile(path=absolute_path),
+                                caption=text if i == 0 else None
+                            )
+                        )
+                if media_group:
+                    await message.bot.send_media_group(user_id, media=media_group)
+                    if buttons:  # Отправляем клавиатуру отдельным сообщением после медиа
+                        await message.bot.send_message(user_id, "Действия:", reply_markup=keyboard)
+                    continue
+            await message.bot.send_message(user_id, text, reply_markup=keyboard)        
+    await state.clear()
+
+async def show_search_results(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    listings = search_listings(data['filters'])
+    user_id = callback.from_user.id
+    role = get_user_role(user_id)
+    
+    if not listings:
+        await callback.message.bot.send_message(user_id, "Объявлений не найдено.", reply_markup=get_request_keyboard(user_id))
+    else:
+        uploads_dir = os.path.join(BASE_DIR, '..', 'uploads')
+        for listing in listings:
+            listing_id, listing_type, _, _, _, _, admin_id, _, image_paths, params, telegram_post_link = listing
+            text = f"{listing_type}\n"
+            if 'city' in params:
+                text += f"Город: {params['city']}\n"
+            if 'district' in params:
+                text += f"Район: {params['district']}\n"
+            if 'term' in params:
+                text += f"Срок аренды: {params['term']}"
+
+            buttons = []
+            if role == 'superadmin' or (role == 'admin' and admin_id == user_id):
+                buttons.append([types.InlineKeyboardButton(text="Редактировать", callback_data=f"edit_{listing_id}"),
+                                types.InlineKeyboardButton(text="Удалить", callback_data=f"delete_{listing_id}")])
+            if telegram_post_link:
+                buttons.append([types.InlineKeyboardButton(text="Посмотреть подробности", callback_data=f"post_{listing_id}")])
+            keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+            
+            if image_paths:
+                media_group = [types.InputMediaPhoto(media=types.FSInputFile(os.path.join(uploads_dir, os.path.basename(path))),
+                                                    caption=text if i == 0 else None) 
+                              for i, path in enumerate(image_paths[:10]) if os.path.exists(os.path.join(uploads_dir, os.path.basename(path)))]
+                if media_group:
+                    await callback.message.bot.send_media_group(user_id, media=media_group)
+                    if buttons:
+                        await callback.message.bot.send_message(user_id, "Действия:", reply_markup=keyboard)
+                    continue
+            await callback.message.bot.send_message(user_id, text, reply_markup=keyboard)
+        
+        await callback.message.bot.send_message(user_id, "Поиск завершён.", reply_markup=get_request_keyboard(user_id))
+    await callback.message.delete()
+    await state.clear()
+
+async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await state.clear()
+    if get_user_role(user_id) in ['admin', 'superadmin']:
+        await callback.message.bot.send_message(user_id, "Меню администратора:", reply_markup=get_main_menu(user_id))
+    await callback.message.delete()  # Удаляем старое сообщение
+
+async def create_request_start(message: types.Message, state: FSMContext):
+    buttons = [[types.InlineKeyboardButton(text="Начать заполнение заявки", callback_data="start_request_filling")]]
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.reply("Нажмите, чтобы начать заполнение заявки:", reply_markup=keyboard)
+
+async def start_request_filling(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RequestState.waiting_for_name)
+    await callback.message.edit_text("Введите ваше имя:", reply_markup=None)
+    await callback.answer()
+
+async def process_request_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    await state.update_data(name=name)
+    await state.set_state(RequestState.waiting_for_phone)
+    user_id = message.from_user.id  # Получаем user_id из сообщения
+    await message.reply("Введите ваш номер телефона:", reply_markup=get_request_keyboard(user_id))
+
+async def process_request_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    await state.set_state(RequestState.waiting_for_district)
+    user_id = message.from_user.id  # Получаем user_id из сообщения
+    await message.reply("Введите район, который вас интересует:", reply_markup=get_request_keyboard(user_id))
+
+async def process_request_district(message: types.Message, state: FSMContext):
+    district = message.text.strip()
+    await state.update_data(district=district)
+    await state.set_state(RequestState.waiting_for_date)
+    user_id = message.from_user.id  # Получаем user_id из сообщения
+    await message.reply("Укажите дату, когда вам нужно жильё (например, 15.10.2025):", reply_markup=get_request_keyboard(user_id))
+
+async def process_request_date(message: types.Message, state: FSMContext):
+    date = message.text.strip()
+    await state.update_data(date=date)
+    await state.set_state(RequestState.waiting_for_comment)
+    user_id = message.from_user.id  # Получаем user_id из сообщения
+    await message.reply("Оставьте комментарий (или напишите 'нет', если комментария нет):", reply_markup=get_request_keyboard(user_id))
+
+async def process_request_comment(message: types.Message, state: FSMContext, bot: Bot):
+    comment = message.text.strip()
+    data = await state.get_data()
+    user_id = message.from_user.id
+    username = message.from_user.username or f"User_{user_id}"
+
+    # Формируем текст заявки
+    request_text = (
+        f"Новая заявка от @{username} (ID: {user_id}):\n"
+        f"Имя: {data['name']}\n"
+        f"Номер телефона: {data['phone']}\n"
+        f"Район: {data['district']}\n"
+        f"Дата: {data['date']}\n"
+        f"Комментарий: {comment if comment.lower() != 'нет' else 'Нет комментария'}"
+    )
+
+    # Отправляем заявку всем админам
+    admins = get_all_admins()
+    for admin_id, _ in admins:
+        try:
+            await bot.send_message(admin_id, request_text)
+        except Exception as e:
+            print(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+
+    # Сохраняем в Google Sheets
+    worksheet = get_or_create_worksheet(sheet, "Заявки")
+    row = [str(user_id), username, data['name'], data['phone'], data['district'], data['date'], comment if comment.lower() != 'нет' else '']
+    worksheet.append_row(row)
+
+    # Подтверждение пользователю
+    await message.reply("Ваша заявка отправлена! Мы скоро свяжемся с вами.", reply_markup=get_main_menu(user_id))
+    await state.clear()
+
+async def process_post_link(callback: types.CallbackQuery):
+    listing_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    # Получаем информацию о листинге и реферальной ссылке пользователя
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT telegram_post_link FROM listings WHERE id=?", (listing_id,))
+    result = c.fetchone()
+    telegram_post_link = result[0] if result else None
+    
+    c.execute("SELECT referral_link_id FROM users WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    referral_link_id = result[0] if result else None
+    
+    if telegram_post_link:
+        # Записываем клик
+        if referral_link_id:
+            track_referral_click(referral_link_id, listing_id, user_id)
+        
+        # Отправляем ссылку пользователю
+        await callback.message.bot.send_message(user_id, f"Подробнее: {telegram_post_link}")
+    else:
+        await callback.message.bot.send_message(user_id, "У этого объявления нет ссылки на пост.")
+    
+    conn.close()
+    await callback.answer()
+
+--- rent-bot/source/handlers/admin.py ---
+#admin.py
+import os
+from aiogram import Bot, types
+from aiogram.fsm.context import FSMContext
+from db import add_listing, generate_referral_code, get_connection, get_user_role, sync_clients, sync_referral_stats, update_listing, delete_listing, search_listings
+from keyboards import get_main_menu, add_back_button
+from states import ListingState, EditState
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Настройка Google Sheets
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
+client = gspread.authorize(creds)
+sheet = client.open("Бот риэлтор").worksheet("Параметры объявления")
+
+USER_VALUES = None
+
+def load_param_values():
+    global USER_VALUES
+    data = sheet.get_all_records()
+    result = {
+        'city': set(),
+        'districts_by_city': {},
+        'rooms': set(),
+        'floor': set(),
+    }
+    for row in data:
+        result['city'].add(str(row['city']))
+        result['districts_by_city'].setdefault(row['city'], set()).add(str(row['district']))
+        result['rooms'].add(str(row['rooms']))
+        result['floor'].add(str(row['floor']))
+    USER_VALUES = result
+
+load_param_values()
+
+LISTING_STEPS = {
+    'Аренда': [
+        ('city', 'Какой город', lambda state_data=None: sorted(list(USER_VALUES['city']))),
+        ('price', 'Укажите цену (введите число или пропустите)', lambda state_data=None: None),
+        ('deposit', 'Наличие кауции (Да/Нет или пропустите)', lambda state_data=None: ['Да', 'Нет']),
+        ('district', 'Какой район', lambda state_data: sorted(list(USER_VALUES['districts_by_city'].get(state_data.get('params_collected', {}).get('city', ''), set())))),
+        ('address', 'Укажите адрес или ориентир (или пропустите)', lambda state_data=None: None),
+        ('room_type', 'Тип комнаты', lambda state_data=None: ['Отдельная', 'Смежная', 'Студия']),
+        ('term', 'Формат аренды', lambda state_data=None: ['Краткосрочная', 'Долгосрочная']),
+        ('room_area', 'Площадь комнаты (в м², введите число или пропустите)', lambda state_data=None: None),
+        ('total_area', 'Площадь квартиры (в м², введите число или пропустите)', lambda state_data=None: None),
+        ('floor', 'Этаж', lambda state_data=None: sorted(list(USER_VALUES['floor']))),
+        ('rooms', 'Кол-во комнат в квартире', lambda state_data=None: sorted(list(USER_VALUES['rooms']))),
+        ('telegram_post_link', 'Ссылка на пост в Telegram (или пропустите)', lambda state_data=None: None),
+        ('description', 'Введите описание (или пропустите)', lambda state_data=None: None),
+        ('image_paths', 'Загрузите до 10 фото (отправляйте по одному)', lambda state_data=None: None)
+    ]
+}
+
+# ... (оставляем остальной код без изменений до нужных функций)
+
+async def create_listing_start(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"type_{ht}")] for ht in LISTING_STEPS.keys()]
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+    await callback.message.edit_text("Выберите тип жилья:", reply_markup=keyboard)
+
+async def process_listing_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_listing(callback, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    buttons = []
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+    await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
+
+async def process_listing_step_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_listing_after_message(message, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    buttons = []
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+    await message.reply(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
+
+async def prev_listing_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step_index = data.get('step_index', 1)
+    if step_index <= 1:
+        buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"type_{ht}")] for ht in LISTING_STEPS.keys()]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+        await callback.message.edit_text("Выберите тип жилья:", reply_markup=keyboard)
+        await state.update_data(step_index=0)
+    else:
+        await state.update_data(step_index=step_index - 1)
+        await process_listing_step(callback, state)
+    await callback.answer()
+
+async def process_listing_type(callback: types.CallbackQuery, state: FSMContext):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    housing_type = callback.data.split("_")[1]
+    await state.update_data(type=housing_type, params_collected={'image_paths': []}, step_index=0)
+    await state.set_state(ListingState.step)
+    await process_listing_step(callback, state)
+
+async def process_listing_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    param_key = data['current_param']
+    params_collected = data['params_collected']
+    
+    if param_key in ['price', 'room_area', 'total_area']:
+        try:
+            value = float(message.text)
+            params_collected[param_key] = value
+        except ValueError:
+            await message.reply("Пожалуйста, введите корректное число!")
+            return
+    elif param_key in ['address', 'description', 'telegram_post_link']:  # Добавили telegram_post_link
+        params_collected[param_key] = message.text
+    # Район тоже можно вводить текстом, если это нужно, но оставим выбор через кнопки
+    
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_listing_step_after_message(message, state)
+
+async def skip_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(step_index=data['step_index'] + 1)
+    await process_listing_step(callback, state)
+    await callback.answer()  # Подтверждаем обработку callback
+
+async def process_listing_option(callback: types.CallbackQuery, state: FSMContext):
+    option = callback.data.split("_")[1]
+    data = await state.get_data()
+    params_collected = data['params_collected']
+    params_collected[data['current_param']] = option
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_listing_step(callback, state)
+
+async def process_listing_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if data['current_param'] == 'image_paths':
+        photo = message.photo[-1]
+        file_path = f"uploads/{photo.file_id}.jpg"
+        await message.bot.download(photo, file_path)
+        params_collected = data['params_collected']
+        params_collected['image_paths'].append(file_path)
+        if len(params_collected['image_paths']) >= 10:
+            await save_listing_after_message(message, state)
+        else:
+            await state.update_data(params_collected=params_collected)
+            await process_listing_step_after_message(message, state)
+
+async def save_listing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data['params_collected']
+    params['type'] = data['type']
+    add_listing(params, callback.from_user.id)
+    await callback.message.edit_text("Объявление создано!", reply_markup=get_main_menu(callback.from_user.id))
+    await state.clear()
+
+async def save_listing_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    params = data['params_collected']
+    params['type'] = data['type']
+    add_listing(params, message.from_user.id)
+    await message.reply("Объявление создано!", reply_markup=get_main_menu(message.from_user.id))
+    await state.clear()
+
+async def manual_save_listing(callback: types.CallbackQuery, state: FSMContext):
+    await save_listing(callback, state)
+
+async def reload_params(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    try:
+        load_param_values()
+        await callback.message.edit_text("Параметры перезагружены!", reply_markup=get_main_menu(callback.from_user.id))
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка: {str(e)}", reply_markup=get_main_menu(callback.from_user.id))
+
+async def edit_listing(callback: types.CallbackQuery, state: FSMContext):
+    listing_id = int(callback.data.split("_")[1])
+    listings = search_listings({'id': listing_id})
+    if not listings:
+        await callback.answer("Объявление не найдено!", show_alert=True)
+        return
+    listing = listings[0]
+    role = get_user_role(callback.from_user.id)
+    if role != 'superadmin' and listing[6] != callback.from_user.id:  # Индекс 6 - admin_id
+        await callback.answer("Это не ваше объявление!", show_alert=True)
+        return
+    
+    # Используем params из новой структуры
+    params = listing[9]  # Индекс 9 - словарь params
+    params['image_paths'] = listing[8]  # Индекс 8 - image_paths
+    await state.update_data(listing_id=listing_id, type=listing[1], params_collected=params, step_index=0)
+    await state.set_state(EditState.step)
+    await process_edit_step(callback, state)
+
+async def process_edit_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_edited_listing(callback, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    buttons = []
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"edit_option_{opt}")] for opt in options]
+        buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")])
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))  # Без is_search/is_listing
+        await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
+                                        reply_markup=keyboard)
+    else:
+        buttons = [[types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")]]
+        if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
+            buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_edit_listing")])
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))  # Без is_search/is_listing
+        await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
+                                        reply_markup=keyboard)
+        if param_key == 'image_paths':
+            await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
+
+async def skip_edit_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    # Оставляем текущий параметр без изменений
+    await state.update_data(step_index=data['step_index'] + 1)
+    await process_edit_step(callback, state)
+
+async def process_edit_option(callback: types.CallbackQuery, state: FSMContext):
+    option = callback.data.split("_")[2]
+    data = await state.get_data()
+    params_collected = data['params_collected']
+    params_collected[data['current_param']] = option
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_edit_step(callback, state)
+
+async def process_edit_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    param_key = data['current_param']
+    params_collected = data['params_collected']
+    
+    if param_key in ['price', 'room_area', 'total_area']:
+        try:
+            value = float(message.text)
+            params_collected[param_key] = value
+        except ValueError:
+            await message.reply("Пожалуйста, введите корректное число!")
+            return
+    elif param_key in ['address', 'description', 'telegram_post_link']:  # Добавили telegram_post_link
+        params_collected[param_key] = message.text
+    
+    await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
+    await process_edit_step_after_message(message, state)
+
+async def process_edit_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if data['current_param'] == 'image_paths':
+        photo = message.photo[-1]
+        file_path = f"uploads/{photo.file_id}.jpg"
+        await message.bot.download(photo, file_path)
+        params_collected = data['params_collected']
+        params_collected['image_paths'].append(file_path)
+        if len(params_collected['image_paths']) >= 10:
+            await save_edited_listing_after_message(message, state)
+        else:
+            await state.update_data(params_collected=params_collected)
+            await process_edit_step_after_message(message, state)
+
+async def process_edit_step_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_edited_listing_after_message(message, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    keyboard = add_back_button(None)
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
+        buttons = [[types.InlineKeyboardButton(text="Сохранить", callback_data="save_edit_listing")]]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"edit_option_{opt}")] for opt in options]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+        await message.reply(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
+                           reply_markup=keyboard)
+    else:
+        await message.reply(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
+                           reply_markup=keyboard)
+        if param_key == 'image_paths':
+            await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
+
+async def save_edited_listing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    params = data['params_collected']
+    params['type'] = data['type']
+    update_listing(data['listing_id'], params)
+    await callback.message.edit_text("Объявление обновлено!", reply_markup=get_main_menu(callback.from_user.id))
+    await state.clear()
+
+async def save_edited_listing_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    params = data['params_collected']
+    params['type'] = data['type']
+    update_listing(data['listing_id'], params)
+    await message.reply("Объявление обновлено!", reply_markup=get_main_menu(message.from_user.id))
+    await state.clear()
+
+async def manual_save_edit_listing(callback: types.CallbackQuery, state: FSMContext):
+    await save_edited_listing(callback, state)
+
+async def delete_listing(callback: types.CallbackQuery):
+    listing_id = int(callback.data.split("_")[1])
+    listings = search_listings({'id': listing_id})
+    if not listings:
+        await callback.answer("Объявление не найдено!", show_alert=True)
+        return
+    role = get_user_role(callback.from_user.id)
+    if role != 'superadmin' and listings[0][8] != callback.from_user.id:
+        await callback.answer("Это не ваше объявление!", show_alert=True)
+        return
+    delete_listing(listing_id)
+    await callback.message.edit_text("Объявление удалено!", reply_markup=get_main_menu(callback.from_user.id))
+
+async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    await state.clear()
+    await callback.message.bot.send_message(user_id, "Меню администратора:", reply_markup=get_main_menu(user_id))
+    await callback.message.delete()
+
+from states import ReferralState
+
+# Начало работы с реферальной программой
+async def referral_program_start(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    buttons = [
+        [types.InlineKeyboardButton(text="Создать реферальную ссылку", callback_data="create_referral")],
+        [types.InlineKeyboardButton(text="Мои реферальные ссылки", callback_data="list_referrals")]
+    ]
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Реферальная программа:", reply_markup=keyboard)
+
+# Создание новой реферальной ссылки
+async def create_referral_start(callback: types.CallbackQuery, state: FSMContext):
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    await state.set_state(ReferralState.waiting_for_description_create)
+    await callback.message.edit_text("Введите описание для реферальной ссылки:")
+
+async def process_referral_description_create(message: types.Message, state: FSMContext, bot: Bot):
+    description = message.text
+    admin_id = message.from_user.id
+    referral_code = generate_referral_code()
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT INTO referral_links (admin_id, referral_code, description) VALUES (?, ?, ?)", 
+              (admin_id, referral_code, description))
+    conn.commit()
+    conn.close()
+    bot_username = (await bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={referral_code}"
+    await message.reply(f"Реферальная ссылка создана! Ссылка: {link}\nОписание: {description}", 
+                       reply_markup=get_main_menu(admin_id))
+    await state.clear()
+
+async def list_referrals(callback: types.CallbackQuery, bot: Bot):  # Добавляем bot как параметр
+    if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
+        await callback.answer("Ты не админ!", show_alert=True)
+        return
+    admin_id = callback.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, referral_code, description FROM referral_links WHERE admin_id=?", (admin_id,))
+    referrals = c.fetchall()
+    conn.close()
+    if not referrals:
+        await callback.message.edit_text("У вас нет реферальных ссылок.", 
+                                       reply_markup=get_main_menu(admin_id))
+        return
+    bot_username = (await bot.get_me()).username  # Получаем имя бота
+    buttons = []
+    for ref_id, code, desc in referrals:
+        link = f"https://t.me/{bot_username}?start={code}"
+        # Обновляем текст кнопки, чтобы включить полную ссылку
+        buttons.append([types.InlineKeyboardButton(text=f"{desc}: {link}", callback_data=f"referral_{ref_id}")])
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Ваши реферальные ссылки:", reply_markup=keyboard)
+
+# Опции для конкретной ссылки
+async def referral_options(callback: types.CallbackQuery):
+    ref_id = int(callback.data.split("_")[1])
+    buttons = [
+        [types.InlineKeyboardButton(text="Редактировать", callback_data=f"edit_referral_{ref_id}")],
+        [types.InlineKeyboardButton(text="Удалить", callback_data=f"delete_referral_{ref_id}")]
+    ]
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("Выберите действие:", reply_markup=keyboard)
+
+# Удаление ссылки
+async def delete_referral(callback: types.CallbackQuery):
+    ref_id = int(callback.data.split("_")[2])
+    admin_id = callback.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM referral_links WHERE id=? AND admin_id=?", (ref_id, admin_id))
+    conn.commit()
+    conn.close()
+    await callback.message.edit_text("Реферальная ссылка удалена!", 
+                                   reply_markup=get_main_menu(admin_id))
+
+# Редактирование ссылки
+async def edit_referral_start(callback: types.CallbackQuery, state: FSMContext):
+    ref_id = int(callback.data.split("_")[2])
+    await state.update_data(ref_id=ref_id)
+    await state.set_state(ReferralState.waiting_for_description_edit)
+    await callback.message.edit_text("Введите новое описание для реферальной ссылки:")
+
+async def process_referral_description_edit(message: types.Message, state: FSMContext):
+    description = message.text
+    data = await state.get_data()
+    ref_id = data['ref_id']
+    admin_id = message.from_user.id
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE referral_links SET description=? WHERE id=? AND admin_id=?", 
+              (description, ref_id, admin_id))
+    conn.commit()
+    conn.close()
+    await message.reply("Описание обновлено!", reply_markup=get_main_menu(admin_id))
+    await state.clear()
+
+
+async def sync_data(callback: types.CallbackQuery):
+    if get_user_role(callback.from_user.id) != 'superadmin':
+        await callback.answer("Ты не суперадмин!", show_alert=True)
+        return
+    try:
+        sync_clients()
+        sync_referral_stats()
+        await callback.message.edit_text("Данные синхронизированы!", 
+                                       reply_markup=get_main_menu(callback.from_user.id))
+    except Exception as e:
+        await callback.message.edit_text(f"Ошибка: {str(e)}", 
+                                       reply_markup=get_main_menu(callback.from_user.id))
+
+async def show_admin_menu(message: types.Message):
+    user_id = message.from_user.id
+    role = get_user_role(user_id)
+    if role in ['admin', 'superadmin']:
+        await message.reply("Меню администратора:", reply_markup=get_main_menu(user_id))
+    else:
+        await message.reply("Эта команда доступна только администраторам.", reply_markup=get_request_keyboard(user_id))

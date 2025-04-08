@@ -14,7 +14,7 @@ CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
 client = gspread.authorize(creds)
-sheet = client.open("Бот риэлтор").worksheet("params")
+sheet = client.open("Бот риэлтор").worksheet("Параметры объявления")
 
 USER_VALUES = None
 
@@ -55,13 +55,78 @@ LISTING_STEPS = {
     ]
 }
 
+# ... (оставляем остальной код без изменений до нужных функций)
+
 async def create_listing_start(callback: types.CallbackQuery):
     if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
         await callback.answer("Ты не админ!", show_alert=True)
         return
     buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"type_{ht}")] for ht in LISTING_STEPS.keys()]
-    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
     await callback.message.edit_text("Выберите тип жилья:", reply_markup=keyboard)
+
+async def process_listing_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_listing(callback, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    buttons = []
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+    await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
+
+async def process_listing_step_after_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    steps = LISTING_STEPS[data['type']]
+    step_index = data['step_index']
+    
+    if step_index >= len(steps):
+        await save_listing_after_message(message, state)
+        return
+    
+    param_key, prompt, options_func = steps[step_index]
+    options = options_func(data) if options_func else None
+    await state.update_data(current_param=param_key)
+    
+    buttons = []
+    if options:
+        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
+    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
+    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
+        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
+    
+    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+    await message.reply(prompt + ":", reply_markup=keyboard)
+    if param_key == 'image_paths':
+        await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
+
+async def prev_listing_step(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    step_index = data.get('step_index', 1)
+    if step_index <= 1:
+        buttons = [[types.InlineKeyboardButton(text=ht, callback_data=f"type_{ht}")] for ht in LISTING_STEPS.keys()]
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons), is_listing=True)
+        await callback.message.edit_text("Выберите тип жилья:", reply_markup=keyboard)
+        await state.update_data(step_index=0)
+    else:
+        await state.update_data(step_index=step_index - 1)
+        await process_listing_step(callback, state)
+    await callback.answer()
 
 async def process_listing_type(callback: types.CallbackQuery, state: FSMContext):
     if get_user_role(callback.from_user.id) not in ['admin', 'superadmin']:
@@ -91,32 +156,6 @@ async def process_listing_text(message: types.Message, state: FSMContext):
     await state.update_data(params_collected=params_collected, step_index=data['step_index'] + 1)
     await process_listing_step_after_message(message, state)
 
-async def process_listing_step(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    steps = LISTING_STEPS[data['type']]
-    step_index = data['step_index']
-    
-    if step_index >= len(steps):
-        await save_listing(callback, state)
-        return
-    
-    param_key, prompt, options_func = steps[step_index]
-    options = options_func(data) if options_func else None
-    await state.update_data(current_param=param_key)
-    
-    buttons = []
-    if options:  # Если есть варианты выбора (кнопки)
-        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
-    # Всегда добавляем "Пропустить"
-    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
-    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
-        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
-    
-    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.message.edit_text(prompt + ":", reply_markup=keyboard)
-    if param_key == 'image_paths':
-        await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
-
 async def skip_step(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.update_data(step_index=data['step_index'] + 1)
@@ -144,32 +183,6 @@ async def process_listing_image(message: types.Message, state: FSMContext):
         else:
             await state.update_data(params_collected=params_collected)
             await process_listing_step_after_message(message, state)
-
-async def process_listing_step_after_message(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    steps = LISTING_STEPS[data['type']]
-    step_index = data['step_index']
-    
-    if step_index >= len(steps):
-        await save_listing_after_message(message, state)
-        return
-    
-    param_key, prompt, options_func = steps[step_index]
-    options = options_func(data) if options_func else None
-    await state.update_data(current_param=param_key)
-    
-    buttons = []
-    if options:
-        buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"option_{opt}")] for opt in options]
-    # Всегда добавляем "Пропустить"
-    buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_step")])
-    if param_key == 'image_paths' and len(data['params_collected']['image_paths']) > 0:
-        buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_listing")])
-    
-    keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
-    await message.reply(prompt + ":", reply_markup=keyboard)
-    if param_key == 'image_paths':
-        await message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте фото или пропустите.")
 
 async def save_listing(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -236,14 +249,14 @@ async def process_edit_step(callback: types.CallbackQuery, state: FSMContext):
     if options:
         buttons = [[types.InlineKeyboardButton(text=opt, callback_data=f"edit_option_{opt}")] for opt in options]
         buttons.append([types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")])
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))  # Без is_search/is_listing
         await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
                                         reply_markup=keyboard)
     else:
         buttons = [[types.InlineKeyboardButton(text="Пропустить", callback_data="skip_edit_step")]]
         if param_key == 'image_paths' and len(data['params_collected']['image_paths']) < 10:
             buttons.append([types.InlineKeyboardButton(text="Сохранить", callback_data="save_edit_listing")])
-        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))
+        keyboard = add_back_button(types.InlineKeyboardMarkup(inline_keyboard=buttons))  # Без is_search/is_listing
         await callback.message.edit_text(f"{prompt} (текущее: {data['params_collected'].get(param_key, 'не указано')}):", 
                                         reply_markup=keyboard)
         if param_key == 'image_paths':
@@ -357,8 +370,10 @@ async def delete_listing(callback: types.CallbackQuery):
     await callback.message.edit_text("Объявление удалено!", reply_markup=get_main_menu(callback.from_user.id))
 
 async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
     await state.clear()
-    await callback.message.edit_text("Добро пожаловать! Выберите действие:", reply_markup=get_main_menu(callback.from_user.id))
+    await callback.message.bot.send_message(user_id, "Меню администратора:", reply_markup=get_main_menu(user_id))
+    await callback.message.delete()
 
 from states import ReferralState
 
@@ -477,11 +492,11 @@ async def sync_data(callback: types.CallbackQuery):
     except Exception as e:
         await callback.message.edit_text(f"Ошибка: {str(e)}", 
                                        reply_markup=get_main_menu(callback.from_user.id))
-        
+
 async def show_admin_menu(message: types.Message):
     user_id = message.from_user.id
     role = get_user_role(user_id)
     if role in ['admin', 'superadmin']:
         await message.reply("Меню администратора:", reply_markup=get_main_menu(user_id))
     else:
-        await message.reply("Эта команда доступна только администраторам.")
+        await message.reply("Эта команда доступна только администраторам.", reply_markup=get_request_keyboard(user_id))

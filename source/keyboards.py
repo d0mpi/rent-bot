@@ -1,7 +1,7 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from db import get_user_role
 
 def get_main_menu(user_id):
-    from db import get_user_role 
     buttons = []
     role = get_user_role(user_id)
     
@@ -10,29 +10,21 @@ def get_main_menu(user_id):
             [InlineKeyboardButton(text="Добавить админа", callback_data="add_admin")],
             [InlineKeyboardButton(text="Удалить админа", callback_data="remove_admin")],
             [InlineKeyboardButton(text="Показать всех админов", callback_data="list_admins")],
-            [InlineKeyboardButton(text="Синхронизировать данные с Google Sheets", callback_data="sync_data")]
+            [InlineKeyboardButton(text="Обновить данные в таблицах", callback_data="sync_data")]
         ])
     if role in ['admin', 'superadmin']:
         buttons.extend([
             [InlineKeyboardButton(text="Создать объявление", callback_data="create_listing")],
-            [InlineKeyboardButton(text="Перезагрузить параметры", callback_data="reload_params")],
+            [InlineKeyboardButton(text="Вытащить данные из таблиц", callback_data="reload_params")],
             [InlineKeyboardButton(text="Реферальная программа", callback_data="referral_program")]
         ])
     
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_back_button():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Назад в начало", callback_data="back_to_start")]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 def get_request_keyboard(user_id):
-    """Создаёт клавиатуру с кнопками 'Подобрать жильё для меня', 'Найти жильё' и 'Меню' (для админов)"""
-    from db import get_user_role
     role = get_user_role(user_id)
-    
     keyboard = [
-        [KeyboardButton(text="Подобрать жильё для меня"), KeyboardButton(text="Найти жильё")]
+        [KeyboardButton(text="Оставить заявку"), KeyboardButton(text="Посмотреть варианты")]
     ]
     if role in ['admin', 'superadmin']:
         keyboard.append([KeyboardButton(text="Меню")])
@@ -40,11 +32,21 @@ def get_request_keyboard(user_id):
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        one_time_keyboard=False  # Клавиатура будет постоянной
+        one_time_keyboard=False
     )
 
-def add_back_button(keyboard):
+def add_back_button(keyboard, is_search=False, is_listing=False):
     if not keyboard:
-        return get_back_button()
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад в начало", callback_data="back_to_start")])
+        if is_search:
+            return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="prev_search_step")]])
+        elif is_listing:
+            return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="prev_listing_step")]])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="back_to_start")]])
+    
+    if is_search:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="prev_search_step")])
+    elif is_listing:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="prev_listing_step")])
+    else:
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="Назад", callback_data="back_to_start")])
     return keyboard

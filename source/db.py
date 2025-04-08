@@ -19,7 +19,7 @@ def init_db():
                   admin_id INTEGER, 
                   image_paths TEXT, 
                   params TEXT,
-                  telegram_post_link TEXT)''')  # Добавлено поле для ссылки на пост
+                  telegram_post_link TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS referral_links
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                   admin_id INTEGER, 
@@ -30,7 +30,7 @@ def init_db():
                   referral_link_id INTEGER,
                   listing_id INTEGER,
                   click_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                  user_id INTEGER)''')  # Новая таблица для отслеживания кликов
+                  user_id INTEGER)''')
     c.execute('''INSERT OR IGNORE INTO users (user_id, username, role) 
                  VALUES (?, ?, ?);''', (462522839, '@l_michael_l', 'superadmin'))
     conn.commit()
@@ -130,6 +130,9 @@ def search_listings(filters):
     if 'type' in filters:
         query += " AND type=?"
         params_list.append(filters['type'])
+    if 'id' in filters:  # Добавляем поддержку фильтра по ID
+        query += " AND id=?"
+        params_list.append(filters['id'])
     
     c.execute(query, params_list)
     listings = c.fetchall()
@@ -141,7 +144,7 @@ def search_listings(filters):
         
         matches = True
         for key, value in filters.items():
-            if key == 'type':
+            if key in ['type', 'id']:
                 continue
             if key not in params or params[key] != value:
                 matches = False
@@ -187,19 +190,33 @@ def get_or_create_worksheet(spreadsheet, title):
         return spreadsheet.add_worksheet(title=title, rows="100", cols="20")
 
 def sync_clients():
-    worksheet = get_or_create_worksheet(sheet, "Clients")
+    worksheet = get_or_create_worksheet(sheet, "Пользователи")
+    requests_worksheet = get_or_create_worksheet(sheet, "Заявки")
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT user_id, username, referral_link_id FROM users")
     users = c.fetchall()
     conn.close()
-    data = [["user_id", "username", "referral_link_id"]]
+
+    # Получаем данные о заявках из Google Sheets
+    requests_data = requests_worksheet.get_all_records()
+    request_counts = {}
+    for request in requests_data:
+        user_id = str(request.get('id', ''))
+        if user_id:
+            request_counts[user_id] = request_counts.get(user_id, 0) + 1
+
+    # Формируем данные для таблицы Clients
+    data = [["user_id", "username", "referral_link_id", "request_count"]]
     for user in users:
-        data.append([str(user[0]), user[1], str(user[2]) if user[2] else ""])
+        user_id, username, referral_link_id = user
+        request_count = request_counts.get(str(user_id), 0)
+        data.append([str(user_id), username, str(referral_link_id) if referral_link_id else "", str(request_count)])
     worksheet.update('A1', data)
 
 def sync_referral_stats():
-    worksheet = get_or_create_worksheet(sheet, "Referral Statistics")
+    worksheet = get_or_create_worksheet(sheet, "Реферальная статистика")
+    requests_worksheet = get_or_create_worksheet(sheet, "Заявки")
     conn = get_connection()
     c = conn.cursor()
     c.execute('''SELECT rl.id, rl.referral_code, rl.description, 
@@ -211,7 +228,26 @@ def sync_referral_stats():
                  GROUP BY rl.id''')
     stats = c.fetchall()
     conn.close()
-    data = [["id", "referral_code", "description", "unique_users", "total_clicks"]]
+
+    # Получаем данные о заявках из Google Sheets
+    requests_data = requests_worksheet.get_all_records()
+    request_counts_by_ref = {}
+    conn = get_connection()
+    c = conn.cursor()
+    for request in requests_data:
+        user_id = str(request.get('user_id', ''))
+        if user_id:
+            c.execute("SELECT referral_link_id FROM users WHERE user_id=?", (int(user_id),))
+            result = c.fetchone()
+            referral_link_id = result[0] if result else None
+            if referral_link_id:
+                request_counts_by_ref[referral_link_id] = request_counts_by_ref.get(referral_link_id, 0) + 1
+    conn.close()
+
+    # Формируем данные для таблицы Реферальная статистика
+    data = [["id", "referral_code", "description", "unique_users", "total_clicks", "request_count"]]
     for stat in stats:
-        data.append([str(stat[0]), stat[1], stat[2], str(stat[3]), str(stat[4])])
+        ref_id, referral_code, description, unique_users, total_clicks = stat
+        request_count = request_counts_by_ref.get(ref_id, 0)
+        data.append([str(ref_id), referral_code, description, str(unique_users), str(total_clicks), str(request_count)])
     worksheet.update('A1', data)

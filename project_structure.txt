@@ -1,0 +1,11 @@
+rent-bot:
+  source:
+    db.py: file
+    config.py: file
+    keyboards.py: file
+    main.py: file
+    states.py: file
+    handlers:
+      superadmin.py: file
+      user.py: file
+      admin.py: file
