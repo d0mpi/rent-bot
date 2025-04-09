@@ -188,7 +188,7 @@ def get_or_create_worksheet(spreadsheet, title):
         return spreadsheet.add_worksheet(title=title, rows="100", cols="20")
 
 def sync_clients():
-    worksheet = get_or_create_worksheet(sheet, "Пользователи")
+    worksheet = get_or_create_worksheet(sheet, "Clients")
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT user_id, username, referral_link_id FROM users")
@@ -872,7 +872,7 @@ CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scope)
 client = gspread.authorize(creds)
-sheet = client.open("Бот риэлтор").worksheet("Параметры объявления")
+sheet = client.open("Бот риэлтор").worksheet("params")
 
 USER_VALUES = None
 
@@ -1119,7 +1119,7 @@ async def process_edit_step(callback: types.CallbackQuery, state: FSMContext):
                                         reply_markup=keyboard)
         if param_key == 'image_paths':
             await callback.message.reply(f"Загружено фото: {len(data['params_collected']['image_paths'])}/10. Отправьте следующее фото.")
-
+            
 async def skip_edit_step(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     # Оставляем текущий параметр без изменений
